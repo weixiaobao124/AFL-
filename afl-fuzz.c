@@ -7488,7 +7488,15 @@ EXP_ST void setup_dirs_fds(void) {
   }
 
   /* Queue directory for any starting & discovered paths. */
-
+  /*
+   * 建立queue文件夹
+    创建out_dir/queue文件夹，设置权限为0700
+    创建out_dir/queue/.state/,设置权限为0700,该文件夹主要保存用于session resume和related tasks的queue metadata
+    创建out_dir/queue/.state/deterministic_done/,设置权限为0700,该文件夹标记过去经历过deterministic fuzzing的queue entries。
+    创建out_dir/queue/.state/auto_extras/,设置权限为0700,Directory with the auto-selected dictionary entries.
+    创建out_dir/queue/.state/redundant_edges/,设置权限为0700,保存当前被认为是多余的路径集合
+    创建out_dir/queue/.state/variable_behavior/,设置权限为0700,The set of paths showing variable behavior.
+   */
   tmp = alloc_printf("%s/queue", out_dir);
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
@@ -7539,27 +7547,41 @@ EXP_ST void setup_dirs_fds(void) {
   }
 
   /* All recorded crashes. */
-
+  /*
+    建立crashes文件夹
+    创建out_dir/crashes文件夹，设置权限为0700,用于记录crashes
+   */
   tmp = alloc_printf("%s/crashes", out_dir);
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
 
   /* All recorded hangs. */
-
+  /*
+   * 建立hangs文件夹
+     创建out_dir/hangs文件夹，设置权限为0700,用于记录hangs
+   */
   tmp = alloc_printf("%s/hangs", out_dir);
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
 
   /* Generally useful file descriptors. */
-
+  /*
+   * 通常有用的文件描述符
+  dev_null_fd = open("/dev/null", O_RDWR);以读写模式打开/dev/null
+    dev_urandom_fd = open("/dev/urandom", O_RDONLY);,以只读模式打开/dev/urandom
+   */
   dev_null_fd = open("/dev/null", O_RDWR);
   if (dev_null_fd < 0) PFATAL("Unable to open /dev/null");
-
   dev_urandom_fd = open("/dev/urandom", O_RDONLY);
   if (dev_urandom_fd < 0) PFATAL("Unable to open /dev/urandom");
 
   /* Gnuplot output file. */
-
+    /*
+   * 建立Gnuplot输出文件夹
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);以只写方式打开out_dir/plot_data文件，如果文件不存在，就创建，并获取句柄
+        plot_file = fdopen(fd, "w");根据句柄得到FILE* plot_file
+        向其中写入# unix_time, cycles_done, cur_path, paths_total, pending_total, pending_favs, map_size, unique_crashes, unique_hangs, max_depth, execs_per_sec\n
+   */
   tmp = alloc_printf("%s/plot_data", out_dir);
   fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (fd < 0) PFATAL("Unable to create '%s'", tmp);
@@ -8171,8 +8193,15 @@ int main(int argc, char** argv) {
       首先检查sync_id是否已被设置，防止多次设置-M/-S选项。
       使用ck_strdup函数将传入的实例名称存入特定结构的chunk中，并将此chunk的地址写入sync_id。
       */
-      case 'S': 
-
+      case 'S':
+        /*
+         * 首先运行一个Master进程：
+         每一个afl-fuzz都需要占用一个CPU内核。这意味着在多核系统上，能可以运行几个fuzzing。事实上，如果你在多核系统上只运行一个fuzzing工作，这将造成硬件的浪费。所以，并行化是一个很好的方法。
+         然后开始其他的slave进程：
+         每一个fuzzer都在sync_dir文件夹中有一个单独的空间来存储其状态，如/sync_dir/fuzzer01/
+        每一个fuzzer都会遍历/sync_dir/文件夹中被其他fuzzer所创建的测试用例，并且将它们加入自己的fuzzing队列中，如果它们足够有趣的话。
+        Master进程与Slave进程的不同之处在于Master进程使用确定性策略进行变异，而Slave进程则是使用随机性策略。
+        */
         if (sync_id) FATAL("Multiple -S or -M options not supported");
         sync_id = ck_strdup(optarg);
         break;
@@ -8420,6 +8449,7 @@ int main(int argc, char** argv) {
   //save_cmdline 保存argv到局部变量buf中，没看出来有什么用。
   save_cmdline(argc, argv);
 
+  //创建运行时的横幅
   fix_up_banner(argv[optind]);
 
   //check_if_tty 检测是否是终端环境，根据AFL_NO_UI设置not_on_tty = 1。然后通过IOCTL设置TIOCGWINSZ。
@@ -8442,6 +8472,7 @@ int main(int argc, char** argv) {
   //设置共享内存和virgin_bits
   setup_shm();
   //初始化count_class_lookup16数组，为分支路径的规整做准备。
+  //count_class_lookup16[x]  实际访问次数x -->(映射)  映射后的访问次数count_class_lookup16[x]
   init_count_class16();
   //创建一些相关文件夹，写入一些信息
   setup_dirs_fds();
