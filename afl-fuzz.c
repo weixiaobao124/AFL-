@@ -813,14 +813,17 @@ pending_not_fuzzed没被fuzzed测试用例数量++，
 */
 
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
-
+  //先通过calloc动态分配一个queue_entry结构体，并初始化其fname为文件名fn，len为文件大小，depth为cur_depth + 1,passed_det为传递进来的passed_det
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
   q->fname        = fname;
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
-
+  /*
+   * 如果q->depth > max_depth，则设置max_depth为q->depth
+   如果queue_top不为空，则设置queue_top->next为q，queue_top = q;，否则q_prev100 = queue = queue_top = q;
+   */
   if (q->depth > max_depth) max_depth = q->depth;
 
   if (queue_top) {
@@ -835,7 +838,10 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   cycles_wo_finds = 0;
 
-  /* Set next_100 pointer for every 100th element (index 0, 100, etc) to allow faster iteration. */
+  /* Set next_100 pointer for every 100th element (index 0, 100, etc) to allow faster iteration.
+   * 如果queued_paths % 100得到0，则设置q_prev100->next_100 = q; q_prev100 = q;
+     设置last_path_time为当前时间。
+  */
   if ((queued_paths - 1) % 100 == 0 && queued_paths > 1) {
 
     q_prev100->next_100 = q;
@@ -1602,7 +1608,9 @@ struct dirent
       PFATAL("Unable to access '%s'", fn);
 
     /* This also takes care of . and .. */
-
+    /*
+     * 通过文件属性过滤掉.和..这样的regular文件，并检查文件大小，如果文件大小大于MAX_FILE，默认是1024*1024字节，即1M
+     */
     if (!S_ISREG(st.st_mode) || !st.st_size || strstr(fn, "/README.testcases")) {
 
       ck_free(fn);
@@ -1636,6 +1644,8 @@ struct dirent
 
   free(nl); /* not tracked */
   //首先检查是否设置queued_paths，没设置则代表没有测试用例。abort掉
+  //如果queued_paths为0，则代表输入文件夹为0，抛出异常
+  //queued:排队的
   if (!queued_paths) {
 
     SAYF("\n" cLRD "[-] " cRST
@@ -1647,7 +1657,11 @@ struct dirent
     FATAL("No usable test cases in '%s'", in_dir);
 
   }
-
+  /*
+   * 设置last_path_time为0
+    queued_at_start的值设置为queued_paths
+    Total number of initial inputs
+   */
   last_path_time = 0;
   queued_at_start = queued_paths;
 
@@ -1921,7 +1935,7 @@ static inline u8 memcmp_nocase(u8* m1, u8* m2, u32 len) {
 
 
 /* Maybe add automatic extra. */
-
+//跟语料库有关，目前不用管
 static void maybe_add_auto(u8* mem, u32 len) {
 
   u32 i;
@@ -2734,6 +2748,7 @@ static void show_stats(void);
 AFL关键函数:calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,u32 handicap, u8 from_queue)校准一个新的测试用例。
 这是在处理输入目录时完成的，以便在早期就警告有问题的测试用例;当发现新的路径来检测变量行为等等。
 这个函数是AFL的重点函数之一，
+ 这个函数评估input文件夹下的case，来发现这些testcase的行为是否异常；以及在发现新的路径时，用以评估这个新发现的testcase的行为是否是可变（这里的可变是指多次执行这个case，发现的路径不同）等等
 在perform_dry_run，save_if_interesting，fuzz_one，pilot_fuzzing,core_fuzzing函数中均有调用。
 */
 
@@ -2743,6 +2758,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   static u8 first_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0, hnb = 0,
+  //如果q->exec_cksum为0，代表这是这个case第一次运行，即来自input文件夹下，所以将first_run置为1。
       first_run = (q->exec_cksum == 0);
 
   u64 start_us, stop_us;
@@ -2754,13 +2770,19 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   /* Be a bit more generous about timeouts when resuming sessions, or when
      trying to calibrate already-added finds. This helps avoid trouble due
      to intermittent latency. */
-
+  /*
+   * 设置use_tmout为exec_tmout,如果from_queue是0或者resuming_fuzz被置为1，
+   * 即代表不来自于queue中或者在resuming sessions的时候，则use_tmout的值被设置的更大。
+   */
   if (!from_queue || resuming_fuzz)
     use_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
                     exec_tmout * CAL_TMOUT_PERC / 100);
 
   q->cal_failed++;
-
+  /*
+   * 设置stage_name为”calibration”,以及根据是否fast_cal为1，
+   * 来设置stage_max的值为3还是CAL_CYCLES(默认为8)，含义是每个新测试用例（以及显示出可变行为的测试用例）的校准周期数，也就是说这个stage要执行几次的意思。
+   */
   stage_name = "calibration";
   stage_max  = fast_cal ? 3 : CAL_CYCLES;
 
@@ -2771,6 +2793,10 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     init_forkserver(argv);
   
   //拷贝trace_bits到first_trace
+  /*
+   * 如果这个queue不是来自input文件夹，而是评估新case，
+   * 则此时q->exec_cksum不为空，拷贝trace_bits到first_trace里，然后计算has_new_bits的值，赋值给new_bits。
+   */
   if (q->exec_cksum) {
 
     memcpy(first_trace, trace_bits, MAP_SIZE);
@@ -2790,11 +2816,13 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
     u32 cksum;
-
+    //如果这个queue不是来自input文件夹，而是评估新case，且第一轮calibration stage执行结束时，刷新一次展示界面show_stats，用来展示这次执行的结果，此后不再展示。
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
-
+    //write_to_testcase(use_mem, q->len)
+    //将从q->fname中读取的内容写入到.cur_input中
     write_to_testcase(use_mem, q->len);
 
+    //u8 run_target(argv, use_tmout),结果保存在fault中
     fault = run_target(argv, use_tmout);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
@@ -2802,6 +2830,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
+    //计算共享内存里有多少字节被置位了,通过count_bytes函数 u32 count_bytes(u8 *mem)
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
       fault = FAULT_NOINST;
       goto abort_calibration;
@@ -2812,12 +2841,14 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     /*
     这段代码的主要意思是先用cksum也就是本次运行的出现trace_bits哈希和本次testcase q->exec_cksum对比。
     如果发现不同，则调用has_new_bits函数(见2.6)和我们的总表virgin_bits 对比。
+     如果q->exec_cksum不等于cksum，即代表这是第一次运行，或者在相同的参数下，每次执行，cksum却不同，是一个路径可变的queue
     */
     if (q->exec_cksum != cksum) {
       //virgin_bits
       hnb = has_new_bits(virgin_bits);
       if (hnb > new_bits) new_bits = hnb;
 
+      //如果q->exec_cksum不等于0，即代表这是判断是否是可变queue
       if (q->exec_cksum) {
 
         u32 i;
@@ -2825,7 +2856,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
         for (i = 0; i < MAP_SIZE; i++) {
           //当满足var_bytes[i]==0，first_trace[i] != trace_bits[i]时，代表发现了可变的entry
           if (!var_bytes[i] && first_trace[i] != trace_bits[i]) {
-
+            //且var_bytes为空，则将该字节设置为1，并将stage_max设置为CAL_CYCLES_LONG，即需要执行40次。
             var_bytes[i] = 1;
             stage_max    = CAL_CYCLES_LONG;
 
@@ -2834,6 +2865,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
         }
         var_detected = 1;
       //如果q->exec_cksum为零（第一次执行这一队列项）
+      //即代表这是第一次执行这个queue
       //更新q->exec_cksum = cksum（cksum为之前通过trace_bits计算的）
       //trace_bits拷贝到first_trace
       } else {
@@ -2850,12 +2882,14 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   stop_us = get_cur_time_us();
 
   total_cal_us     += stop_us - start_us;
+  //保存所有轮次总的执行时间，加到total_cal_us里，总的执行轮次，加到total_cal_cycles里
   total_cal_cycles += stage_max;
 
   /* OK, let's collect some stats about the performance of this test case.
      This is used for fuzzing air time calculations in calculate_score(). */
 
   q->exec_us     = (stop_us - start_us) / stage_max;
+  //将最后一次执行所覆盖到的路径数保存到q->bitmap_size里
   q->bitmap_size = count_bytes(trace_bits);
   q->handicap    = handicap;
   q->cal_failed  = 0;
@@ -2869,7 +2903,20 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
   /* If this case didn't result in new output from the instrumentation, tell
      parent. This is a non-critical problem, but something to warn the user
-     about. */
+     about.
+
+     如果fault为FAULT_NONE，且该queue是第一次执行，且不属于dumb_mode，而且new_bits为0，代表在这个样例所有轮次的执行里，都没有发现任何新路径和出现异常，设置fault为FAULT_NOBITS
+      如果new_bits为2，且q->has_new_cov为0，设置其值为1，并将queued_with_cov加一，代表有一个queue发现了新路径。
+      如果这个queue是可变路径，即var_detected为1，则计算var_bytes里被置位的tuple个数，保存到var_byte_count里，代表这些tuple具有可变的行为。
+      将这个queue标记为一个variable
+      mark_as_variable(struct queue_entry *q)
+      创建符号链接out_dir/queue/.state/variable_behavior/fname
+      设置queue的var_behavior为1
+      计数variable behavior的计数器queued_variable的值加一
+      恢复之前的stage值
+      如果不是第一次运行这个queue，展示show_stats
+      返回fault的值
+  */
 
   if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
 
@@ -2909,7 +2956,11 @@ abort_calibration:
 static void check_map_coverage(void) {
 
   u32 i;
-
+  /*
+   *  计数trace_bits发现的路径数，如果小于100，就直接返回
+      在trace_bits的数组后半段，如果有值就直接返回。
+      抛出警告WARNF("Recompile binary with newer version of afl to improve coverage!")
+   */
   if (count_bytes(trace_bits) < 100) return;
 
   for (i = (1 << (MAP_SIZE_POW2 - 1)); i < MAP_SIZE; i++)
@@ -3178,6 +3229,11 @@ static void nuke_resume_dir(void);
 
 /* Create hard links for input test cases in the output directory, choosing
    good names and pivoting accordingly. */
+/*
+ * static void pivot_inputs(void)在输出目录中为输入测试用例创建硬链接，选择好名称并相应地旋转。
+使用函数link_or_copy重新命名并且拷贝；使用函数mark_as_det_done为已经经过确定性变异（deterministic）阶段的testcase文件放入deterministic_done文件夹
+ 。这样经过deterministic的testcase就不用浪费时间进行重复。
+ */
 
 static void pivot_inputs(void) {
 
@@ -3190,7 +3246,9 @@ static void pivot_inputs(void) {
 
     u8  *nfn, *rsl = strrchr(q->fname, '/');
     u32 orig_id;
-
+    /*
+     * 在q->fname里找到最后一个’/‘所在的位置，如果找不到，则rsl = q->fname,否则rsl指向’/‘后的第一个字符,其实也就是最后一个/后面的字符串
+     */
     if (!rsl) rsl = q->fname; else rsl++;
 
     /* If the original file name conforms to the syntax and the recorded
@@ -3597,7 +3655,14 @@ static void find_timeout(void) {
   u8  *fn, *off;
   s32 fd, i;
   u32 ret;
-
+  /*
+   *  如果resuming_fuzz为0，则直接return
+      如果in_place_resume为1，则fn = alloc_printf("%s/fuzzer_stats", out_dir);，否则fn = alloc_printf("%s/../fuzzer_stats", in_dir);
+      以只读方式打开fd，读取内容到tmp[4096]里，并在里面搜索”exec_timeout : “，如果搜索不到就直接返回，如果搜索到了，就读取这个timeout的数值，如果大于4就设置为exec_tmout的值。
+      EXP_ST u32 exec_tmout = EXEC_TIMEOUT; / Configurable exec timeout (ms) /
+      timeout_given = 3;
+      timeout_given, / Specific timeout given? /
+   */
   if (!resuming_fuzz) return;
 
   if (in_place_resume) fn = alloc_printf("%s/fuzzer_stats", out_dir);
@@ -8477,8 +8542,10 @@ int main(int argc, char** argv) {
   //创建一些相关文件夹，写入一些信息
   setup_dirs_fds();
   //读取测试用例并入队，在启动时调用
+  //从输入文件夹中读取所有文件，然后将它们排队进行测试(加入queue_entry的结构体)。
   read_testcases();
   //加载automatic extra
+  //load自动生成的提取出来的词典token
   load_auto();
   //在输出目录中为输入测试用例创建硬链接，选择好名字，并据此进行调整。
   pivot_inputs();
@@ -8488,8 +8555,12 @@ int main(int argc, char** argv) {
   */
   if (extras_dir) load_extras(extras_dir);
   //如果没设置timeout_given 那么调用 find_timeout 设置超时时间。
+  /*
+   * 这个想法是，在不指定-t的情况下resuming sessions时，我们不希望一遍又一遍地自动调整超时时间，以防止超时值因随机波动而增长
+   */
   if (!timeout_given) find_timeout();
   //detect_file_args(argv + optind + 1)：检测argv中的 @@ 并替换。
+  //这个函数其实就是识别参数里面有没有@@，如果有就替换为out_dir/.cur_input，如果没有就返回
   detect_file_args(argv + optind + 1);
   //如果没设置out_file，调用setup_stdio_file()，在output/.cur_input新建一个文件作为输出文件，打开后fd赋值给：static s32 out_fd, /* Persistent fd for out_file */
   if (!out_file) setup_stdio_file();
