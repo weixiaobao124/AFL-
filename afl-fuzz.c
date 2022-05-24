@@ -932,6 +932,10 @@ static inline u8 has_new_bits(u8* virgin_map) {
 如果有新的元组出现，则返回2。
 这个函数是在相当大的缓冲区上的每个exec()之后调用的，因此它需要非常快。
 我们以32位和64位的方式做这件事。因此它需要非常快。我们以32位和64位的方式做这件事。
+
+ 和hash32 check_xxx的区别：这个函数是用来记录所有的路径，找到新的路径
+后者是对于某个输入，查看是否有新的路径
+
 */
 
 #ifdef WORD_SIZE_64
@@ -1046,7 +1050,15 @@ static u32 count_bits(u8* mem) {
    new paths. */
 
 static u32 count_bytes(u8* mem) {
-
+  /*
+    初始化计数器ret的值为0，循环读取mem里的值，每次读取4个字节到u32变量v中
+    如果v为0，则代表这四个字节都是0，直接跳过，进入下一次循环
+    如果v不为0，则依次计算v & FF(0),v & FF(1),v & FF(2),v&FF(3)的结果，如果不为0，则计数器ret加一。
+    #define FF(_b) (0xff << ((_b) << 3))
+    (_b) << 3)即_b * 8
+    即0x000000ff左移(_b * 8)位
+    最终结果可以是0x000000ff,0x0000ff00,0x00ff0000,0xff000000其中之一
+   */
   u32* ptr = (u32*)mem;
   u32  i   = (MAP_SIZE >> 2);
   u32  ret = 0;
@@ -1204,7 +1216,11 @@ EXP_ST void init_count_class16(void) {
 
 
 #ifdef WORD_SIZE_64
-
+/*
+ * 8个字节一组去循环读入，直到遍历完整个mem
+每次取两个字节u16 *mem16 = (u16 *) mem
+i从0到3，计算mem16[i]的值，在count_class_lookup16[mem16[i]]里找到对应的取值，并赋值给mem16[i]
+ */
 static inline void classify_counts(u64* mem) {
 
   u32 i = MAP_SIZE >> 3;
