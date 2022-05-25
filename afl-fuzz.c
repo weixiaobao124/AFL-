@@ -2466,6 +2466,7 @@ EXP_ST void init_forkserver(char** argv) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
+//输入保存在.cur_input
 static u8 run_target(char** argv, u32 timeout) {
 
   static struct itimerval it;
@@ -2694,7 +2695,7 @@ static u8 run_target(char** argv, u32 timeout) {
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
    truncated. */
-
+//将从mem中读取len个字节，写入到.cur_input中
 static void write_to_testcase(void* mem, u32 len) {
 
   s32 fd = out_fd;
@@ -3435,7 +3436,7 @@ static void write_crash_readme(void) {
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
-
+//判断一个文件是否是感兴趣的输入(has_new_bits)，即是否访问了新的tuple或者tuple访问次数发生变化，如果是则保存输入文件（放到队列queue中）。
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   u8  *fn = "";
@@ -3448,13 +3449,15 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
+    //如果没有新的path发现或者path命中次数相同，就直接返回0
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
     }    
 
 #ifndef SIMPLE_FILES
-
+    //否则，将case保存到fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths, describe_op(hnb))文件里
+    //add_to_queue(fn, len, 0);将其添加到队列里
     fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
                       describe_op(hnb));
 
@@ -3466,16 +3469,18 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     add_to_queue(fn, len, 0);
 
+    //如果hnb的值是2，代表发现了新path，设置刚刚加入到队列里的queue的has_new_cov字段为1，即queue_top->has_new_cov = 1，然后queued_with_cov计数器加一
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
       queued_with_cov++;
     }
 
+    //保存hash到其exec_cksum
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
-
+    //评估这个queue，calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0)
     res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
 
     if (res == FAULT_ERROR)
@@ -3486,6 +3491,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     ck_write(fd, mem, len, fn);
     close(fd);
 
+    //设置keeping值为1.
     keeping = 1;
 
   }
@@ -3498,7 +3504,17 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
          a handful of samples. We use the presence of new bits in the
          hang-specific bitmap as a signal of uniqueness. In "dumb" mode, we
          just keep everything. */
-
+      /*
+       * FAULT_TMOUT
+        设置total_tmouts计数器加一
+        如果unique_hangs的个数超过能保存的最大数量KEEP_UNIQUE_HANG，就直接返回keeping的值
+        如果不是dumb mode，就simplify_trace((u64 *) trace_bits)进行规整。
+        如果没有发现新的超时路径，就直接返回keeping
+        否则，代表发现了新的超时路径，unique_tmouts计数器加一
+        如果hang_tmout大于exec_tmout，则以hang_tmout为timeout，重新执行一次runt_target
+        如果结果为FAULT_CRASH，就跳转到keep_as_crash
+        如果结果不是FAULT_TMOUT，就返回keeping，否则就使unique_hangs计数器加一，然后更新last_hang_time的值，并保存到alloc_printf("%s/hangs/id:%06llu,%s", out_dir, unique_hangs, describe_op(0))文件。
+       */
       total_tmouts++;
 
       if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
@@ -3554,7 +3570,15 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       last_hang_time = get_cur_time();
 
       break;
-
+    /*
+       * FAULT_CRASH
+        total_crashes计数器加一
+        如果unique_crashes大于能保存的最大数量KEEP_UNIQUE_CRASH即5000，就直接返回keeping的值
+        同理，如果不是dumb mode，就simplify_trace((u64 *) trace_bits)进行规整
+        如果没有发现新的crash路径，就直接返回keeping
+        否则，代表发现了新的crash路径，unique_crashes计数器加一，并将结果保存到alloc_printf("%s/crashes/id:%06llu,sig:%02u,%s", out_dir,unique_crashes, kill_signal, describe_op(0))文件。
+        更新last_crash_time和last_crash_execs
+     */
     case FAULT_CRASH:
 
 keep_as_crash:
@@ -4864,7 +4888,13 @@ static u32 next_p2(u32 val) {
 /* Trim all new test cases to save cycles when doing deterministic checks. The
    trimmer uses power-of-two increments somewhere between 1/16 and 1/1024 of
    file size, to keep the stage short and sweet. */
-
+/*
+ * 文件大小对模糊性能有很大影响，这是因为大文件使目标二进制文件变得更慢，并且因为它们减少了突变将触及重要的格式控制结构而不是冗余数据块的可能性。这在perf_tips.txt中有更详细的讨论。
+ * 用户可能会提供低质量的起始语料库，某些类型的突变可能会产生迭代地增加生成文件的大小的效果，因此应对这一趋势是很重要的。
+ * 插装反馈提供了一种简单的方法来自动删除输入文件，同时确保对文件的更改不会对执行路径产生影响。
+ * 在afl-fuzz中内置的修边器试图按可变长度和stepover顺序删除数据块;任何不影响跟踪映射校验和的删除都被提交到磁盘。
+ * 修剪器的设计并不是特别彻底;相反，它试图在精度和在进程上花费的execve（）调用的数量之间取得平衡，选择块大小和stepover来匹配。每个文件的平均增益大约在5%到20%之间。
+ */
 static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
   static u8 tmp[64];
@@ -4878,21 +4908,21 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
   /* Although the trimmer will be less useful when variable behavior is
      detected, it will still work to some extent, so we don't check for
      this. */
-
+  //如果这个case的大小len小于5字节，就直接返回
   if (q->len < 5) return 0;
 
   stage_name = tmp;
   bytes_trim_in += q->len;
 
   /* Select initial chunk len, starting with large steps. */
-
+  //计算len_p2，其值是大于等于q->len的第一个2的幂次。（eg.如果len是5704,那么len_p2就是8192）
   len_p2 = next_p2(q->len);
-
+  //取len_p2的1/16为remove_len，这是起始步长。
   remove_len = MAX(len_p2 / TRIM_START_STEPS, TRIM_MIN_BYTES);
 
   /* Continue until the number of steps gets too high or the stepover
      gets too small. */
-
+  //进入while循环，终止条件是remove_len小于终止步长len_p2的1/1024,每轮循环步长会除2.
   while (remove_len >= MAX(len_p2 / TRIM_END_STEPS, TRIM_MIN_BYTES)) {
 
     u32 remove_pos = remove_len;
@@ -4901,14 +4931,14 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
     stage_cur = 0;
     stage_max = q->len / remove_len;
-
+    //进入while循环，remove_pos < q->len,即每次前进remove_len个步长，直到整个文件都被遍历完为止。
     while (remove_pos < q->len) {
 
       u32 trim_avail = MIN(remove_len, q->len - remove_pos);
       u32 cksum;
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
-
+      //由in_buf中remove_pos处开始，向后跳过remove_len个字节，写入到.cur_input里，然后运行一次fault = run_target，trim_execs计数器加一
       fault = run_target(argv, exec_tmout);
       trim_execs++;
 
@@ -4968,7 +4998,8 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
     fd = open(q->fname, O_WRONLY | O_CREAT | O_EXCL, 0600);
 
     if (fd < 0) PFATAL("Unable to create '%s'", q->fname);
-
+    //删除原来的q->fname，创建一个新的q->fname，将in_buf里的内容写入，然后用clean_trace恢复trace_bits的值。
+    //进行一次update_bitmap_score
     ck_write(fd, in_buf, q->len, q->fname);
     close(fd);
 
@@ -4988,7 +5019,7 @@ abort_trimming:
 /* Write a modified test case, run program, process results. Handle
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
-
+//将out_buf中的变异内容输出到文件(write_to_testcase)，并执行(run_target)，并判断这个变异是否为一个感兴趣的变异(save_if_interesting)。
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   u8 fault;
@@ -4999,7 +5030,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
     if (!out_buf || !len) return 0;
 
   }
-
+  //将从mem中读取len个字节，写入到.cur_input中
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
@@ -5027,7 +5058,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   }
 
   /* This handles FAULT_ERROR for us: */
-
+  //判断一个文件是否是感兴趣的输入(has_new_bits)，即是否访问了新的tuple或者tuple访问次数发生变化，如果是则保存输入文件（放到队列queue中）。
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
@@ -5094,7 +5125,14 @@ static u32 calculate_score(struct queue_entry* q) {
   /* Adjust score based on execution speed of this path, compared to the
      global average. Multiplier ranges from 0.1x to 3x. Fast inputs are
      less expensive to fuzz, so we're giving them more air time. */
-
+  /*
+   * 根据queue entry的执行速度、覆盖到的path数和路径深度来评估出一个得分，这个得分perf_score在后面havoc的时候使用。
+   * 前面的没什么好说的，这里的q->depth解释一下，它在每次add_to_queue的时候，会设置为cur_depth+1，而cur_depth是一个全局变量，一开始的初始值为0。处理输入时
+   * 在read_testcases的时候会调用add_to_queue，此时所有的input case的queue depth都会被设置为1。
+   * fuzz_one时
+   * 然后在后面fuzz_one的时候，会先设置cur_depth为当前queue的depth，然后这个queue经过mutate之后调用save_if_interesting,如果是interesting case，
+   * 就会被add_to_queue，此时就建立起了queue之间的关联关系，所以由当前queue变异加入的新queue，深度都在当前queue的基础上再增加。
+   */
   if (q->exec_us * 0.1 > avg_exec_us) perf_score = 10;
   else if (q->exec_us * 0.25 > avg_exec_us) perf_score = 25;
   else if (q->exec_us * 0.5 > avg_exec_us) perf_score = 50;
@@ -5375,7 +5413,7 @@ static u8 fuzz_one(char** argv) {
   if (queue_cur->depth > 1) return 1;
 
 #else
-  //如果设置了pending_favored
+  //如果设置了pending_favored 即没被fuzzed过 但是在等待队列里的
   if (pending_favored) {
 
     /* If we have any favored, non-fuzzed new arrivals in the queue,
@@ -5503,6 +5541,10 @@ static u8 fuzz_one(char** argv) {
    * PERFORMANCE SCORE阶段
    *********************/
   //调用calculate_score(queue_cur)计算当前queue_cur的score
+  /*
+   * 根据case的执行速度/bitmap的大小/case产生时间/路径深度等因素给case进行打分，用来调整在havoc阶段的用时。
+   * 使得执行时间短，代码覆盖高，新发现的，路径深度深的case拥有更多havoc变异的机会。
+   */
   orig_perf = perf_score = calculate_score(queue_cur);
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
@@ -5521,7 +5563,7 @@ static u8 fuzz_one(char** argv) {
 
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
     goto havoc_stage;
-
+  //设置doing_det为1
   doing_det = 1;
 
   /*********************************************
